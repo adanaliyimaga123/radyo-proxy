@@ -1,75 +1,105 @@
-const http = require('http');
-const https = require('https');
-const { spawn } = require('child_process');
-const url = require('url');
+function playStation(station, forceDirectStream = false) {
+    if (isSwitching) return;
+    isSwitching = true;
+    setTimeout(() => { isSwitching = false; }, 800);
 
-const PORT = process.env.PORT || 10000;
+    clearAllStreamTimers();
+    activeStation = station;
+    if (settings.rememberLast) localStorage.setItem('lastStationId', station.id);
 
-http.createServer((req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  const parsedUrl = url.parse(req.url, true);
-  const query = parsedUrl.query;
-  const streamUrl = query.url;
-  const bitrate = query.br; // Eğer br parametresi yoksa undefined dönecek
+    currentTitle.innerText = station.name;
+    songSubtitle.innerText = station.tags || "Canlı Radyo Yayını";
+    songSubtitle.classList.add('active');
 
-  if (!streamUrl) {
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    return res.end('Radyo Proxy ve Sıkıştırma Sunucusu Aktif!');
-  }
+    updateNowPlayingLogo(station);
+    renderVisibleList();
+    renderQuickFavs();
 
-  // 1. DURUM: BR (Bitrate) belirtilmediyse -> SIKIŞTIRMADAN, DİREKT PROXY (ORİJİNAL KALİTE)
-  if (!bitrate) {
-    const lib = streamUrl.startsWith('https') ? https : http;
+    audio.pause();
+    audio.removeAttribute('src');
+    audio.load();
+    if (hls) {
+      hls.destroy();
+      hls = null;
+    }
+    isHlsActive = false;
+
+    const compressing = !forceDirectStream && isCompressionActive();
+    const usingProxyOnly = !forceDirectStream && !compressing && isProxyActive();
+    const useLowStream = !compressing && !usingProxyOnly && !forceDirectStream && settings.preferLowBitrate && Boolean(station.lowUrl);
     
-    const proxyReq = lib.get(streamUrl, (proxyRes) => {
-      res.writeHead(proxyRes.statusCode, {
-        'Content-Type': proxyRes.headers['content-type'] || 'audio/mpeg',
-        'Access-Control-Allow-Origin': '*'
+    let streamToPlay = station.url;
+    if (compressing) {
+      streamToPlay = buildStreamUrl(station.url, true);
+    } else if (usingProxyOnly) {
+      streamToPlay = buildStreamUrl(station.url, false);
+    } else if (useLowStream) {
+      streamToPlay = station.lowUrl;
+    }
+
+    statusText.innerText = (compressing || usingProxyOnly) ? "Proxy sunucusuna bağlanılıyor..." : "Bağlanıyor...";
+
+    const handleStreamFailure = () => {
+      // Eğer proxy/sıkıştırma modundaysak ve bağlantı kurulamadıysa doğrudan hata yönetimine git (autoReconnect tetiklensin)
+      if (compressing || usingProxyOnly) {
+        onPlayError("Proxy bağlantısı zaman aşımına uğradı");
+        return;
+      }
+      if (useLowStream && station.url && station.url !== station.lowUrl) {
+        playStation(station, true);
+        return;
+      }
+      onPlayError();
+    };
+
+    // Proxy veya sıkıştırma modunda Render uykusundan uyanma süresi göz önüne alınarak süre artırıldı
+    const timeoutMs = (compressing || usingProxyOnly) ? 45000 : 10000;
+
+    deadLinkTimer = setTimeout(() => {
+      if (!isPlaying) {
+        handleStreamFailure();
+      }
+    }, timeoutMs);
+
+    if (!compressing && !usingProxyOnly && streamToPlay.includes('.m3u8') && Hls.isSupported()) {
+      isHlsActive = true;
+      hls = new Hls({
+        startLevel: -1,
+        capLevelToPlayerSize: false,
+        maxBufferLength: 25,
+        maxMaxBufferLength: 40
       });
-      proxyRes.pipe(res);
-    });
 
-    proxyReq.on('error', (err) => {
-      res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('Proxy bağlantı hatası');
-    });
+      hls.on(Hls.Events.FRAG_LOADED, (event, data) => {
+        if (data && data.frag && data.frag.stats) {
+          const loadedBytes = data.frag.stats.total || data.frag.stats.loaded || 0;
+          totalBytesConsumed += loadedBytes;
+          updateDataUsageBadge();
+        }
+      });
 
-    req.on('close', () => {
-      proxyReq.destroy();
-    });
+      hls.loadSource(streamToPlay);
+      hls.attachMedia(audio);
+      hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
+        setupAudioContext();
+        audio.play().then(() => onPlaySuccess(false, false, false)).catch(handleStreamFailure);
+      });
+      hls.on(Hls.Events.ERROR, (event, data) => {
+        if (data.fatal) handleStreamFailure();
+      });
+    } else {
+      audio.src = streamToPlay;
+      setupAudioContext();
+      audio.play().then(() => {
+        onPlaySuccess(useLowStream, compressing, usingProxyOnly);
+        startFallbackMeter(station, useLowStream, compressing);
+      }).catch(handleStreamFailure);
+    }
 
-    return;
+    audio.onerror = () => {
+      handleStreamFailure();
+    };
+
+    updateMediaSession(station);
+    if (settings.enableMeta) fetchMetadata(station);
   }
-
-  // 2. DURUM: BR (Bitrate) belirtildiyse -> VERİ TASARRUFU İÇİN FFMPEG İLE SIKIŞTIR
-  res.writeHead(200, {
-    'Content-Type': 'audio/mpeg',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-    'Access-Control-Allow-Origin': '*'
-  });
-
-  const ffmpeg = spawn('ffmpeg', [
-    '-reconnect', '1',
-    '-reconnect_streamed', '1',
-    '-reconnect_delay_max', '5',
-    '-i', streamUrl,
-    '-vn',
-    '-ac', '1',
-    '-ar', '22050',
-    '-b:a', bitrate,
-    '-f', 'mp3',
-    'pipe:1'
-  ]);
-
-  ffmpeg.stdout.pipe(res);
-
-  req.on('close', () => {
-    ffmpeg.kill('SIGKILL');
-  });
-
-  ffmpeg.on('error', (err) => {
-    // FFmpeg hatalarını yut
-  });
-
-}).listen(PORT, () => console.log(`Sunucu ${PORT} portunda çalışıyor`));
