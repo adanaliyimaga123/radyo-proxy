@@ -10,14 +10,14 @@ http.createServer((req, res) => {
   const parsedUrl = url.parse(req.url, true);
   const query = parsedUrl.query;
   const streamUrl = query.url;
-  const bitrate = query.br; // Eğer br parametresi yoksa undefined dönecek
+  const bitrate = query.br;
 
   if (!streamUrl) {
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end('Radyo Proxy ve Sıkıştırma Sunucusu Aktif!');
   }
 
-  // 1. DURUM: BR (Bitrate) belirtilmediyse -> YÖNLENDİRME DESTEKLİ DİREKT PROXY (ORİJİNAL KALİTE)
+  // 1. DURUM: BR YOK -> PROXY MODU (.m3u8 ve .ts dosyaları için akıllı yönlendirme)
   if (!bitrate) {
     let activeProxyReq = null;
 
@@ -25,7 +25,7 @@ http.createServer((req, res) => {
       if (maxRedirects <= 0) {
         if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-          res.end('Çok fazla yönlendirme (Redirect loop)');
+          res.end('Redirect loop');
         }
         return;
       }
@@ -33,9 +33,9 @@ http.createServer((req, res) => {
       const lib = targetUrl.startsWith('https') ? https : http;
 
       activeProxyReq = lib.get(targetUrl, (proxyRes) => {
-        // HTTP Yönlendirmelerini (301, 302, 303, 307, 308) otomatik takip et
+        // Yönlendirmeleri takip et
         if ([301, 302, 303, 307, 308].includes(proxyRes.statusCode) && proxyRes.headers.location) {
-          proxyRes.resume(); // Belleği boşalt
+          proxyRes.resume();
           let redirectUrl = proxyRes.headers.location;
           if (redirectUrl.startsWith('/')) {
             const parsedBase = new URL(targetUrl);
@@ -45,8 +45,13 @@ http.createServer((req, res) => {
         }
 
         if (!res.headersSent) {
+          // HLS uzantıları için doğru içerik türlerini (Content-Type) koru
+          let contentType = proxyRes.headers['content-type'] || 'audio/mpeg';
+          if (targetUrl.includes('.m3u8')) contentType = 'application/vnd.apple.mpegurl';
+          else if (targetUrl.includes('.ts')) contentType = 'video/mp2t';
+
           res.writeHead(proxyRes.statusCode || 200, {
-            'Content-Type': proxyRes.headers['content-type'] || 'audio/mpeg',
+            'Content-Type': contentType,
             'Access-Control-Allow-Origin': '*',
             'Cache-Control': 'no-cache',
             'Connection': 'keep-alive'
@@ -55,7 +60,7 @@ http.createServer((req, res) => {
         proxyRes.pipe(res);
       });
 
-      activeProxyReq.on('error', (err) => {
+      activeProxyReq.on('error', () => {
         if (!res.headersSent) {
           res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
           res.end('Proxy bağlantı hatası');
@@ -72,7 +77,7 @@ http.createServer((req, res) => {
     return;
   }
 
-  // 2. DURUM: BR (Bitrate) belirtildiyse -> VERİ TASARRUFU İÇİN FFMPEG İLE SIKIŞTIR
+  // 2. DURUM: BR VAR -> FFMPEG İLE SIKIŞTIRMA
   res.writeHead(200, {
     'Content-Type': 'audio/mpeg',
     'Cache-Control': 'no-cache',
@@ -83,7 +88,7 @@ http.createServer((req, res) => {
   const ffmpeg = spawn('ffmpeg', [
     '-reconnect', '1',
     '-reconnect_streamed', '1',
-    '-reconnect_delay_max', '1', // Hızlı başlama için süre düşürüldü
+    '-reconnect_delay_max', '1',
     '-i', streamUrl,
     '-vn',
     '-ac', '1',
@@ -99,8 +104,6 @@ http.createServer((req, res) => {
     ffmpeg.kill('SIGKILL');
   });
 
-  ffmpeg.on('error', (err) => {
-    // FFmpeg süreç hatalarını güvenli şekilde yakala ve yut
-  });
+  ffmpeg.on('error', () => {});
 
 }).listen(PORT, () => console.log(`Sunucu ${PORT} portunda çalışıyor`));
