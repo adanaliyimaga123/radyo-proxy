@@ -33,7 +33,7 @@ http.createServer((req, res) => {
       const lib = targetUrl.startsWith('https') ? https : http;
 
       activeProxyReq = lib.get(targetUrl, (proxyRes) => {
-        // HTTP Yönlendirmelerini (301, 302, 307, 308) otomatik takip et
+        // HTTP Yönlendirmelerini (301, 302, 303, 307, 308) otomatik takip et
         if ([301, 302, 303, 307, 308].includes(proxyRes.statusCode) && proxyRes.headers.location) {
           proxyRes.resume(); // Belleği boşalt
           let redirectUrl = proxyRes.headers.location;
