@@ -1,166 +1,196 @@
 const http = require('http');
 const https = require('https');
 const { spawn } = require('child_process');
-const url = require('url');
+const { URL } = require('url');
 
 const PORT = process.env.PORT || 10000;
 
-http.createServer((req, res) => {
+function setCorsHeaders(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  const parsedUrl = url.parse(req.url, true);
-  const query = parsedUrl.query;
-  const streamUrl = query.url;
-  const bitrate = query.br;
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range');
+}
 
-  if (!streamUrl) {
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    return res.end('Radyo Proxy ve Sıkıştırma Sunucusu Aktif!');
-  }
+function handleProxy(req, res, targetUrl) {
+  let activeReq = null;
+  let closed = false;
 
-  // 1. DURUM: BR YOK -> YÖNLENDİRME DESTEKLİ DİREKT PROXY (ORİJİNAL KALİTE)
-  if (!bitrate) {
-    let activeProxyReq = null;
-    let closed = false;
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    if (activeReq) {
+      try { activeReq.destroy(); } catch (_) {}
+      activeReq = null;
+    }
+  };
 
-    function cleanupProxy() {
-      if (closed) return;
-      closed = true;
-      if (activeProxyReq) {
-        try { activeProxyReq.destroy(); } catch (e) {}
-        activeProxyReq = null;
+  const follow = (currentUrl, redirectsLeft = 5) => {
+    if (closed) return;
+
+    if (redirectsLeft <= 0) {
+      if (!res.headersSent && !res.writableEnded) {
+        res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Çok fazla yönlendirme');
       }
+      return cleanup();
     }
 
-    function fetchWithRedirects(targetUrl, maxRedirects = 5) {
-      if (closed) return;
-      if (maxRedirects <= 0) {
-        if (!res.headersSent && !res.writableEnded) {
-          res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-          res.end('Çok fazla yönlendirme (Redirect loop)');
-        }
+    let parsed;
+    try {
+      parsed = new URL(currentUrl);
+    } catch (_) {
+      if (!res.headersSent && !res.writableEnded) {
+        res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Geçersiz yayın adresi');
+      }
+      return cleanup();
+    }
+
+    const client = parsed.protocol === 'https:' ? https : http;
+
+    activeReq = client.get(parsed, (upstreamRes) => {
+      if (closed) {
+        upstreamRes.resume();
         return;
       }
 
-      const lib = targetUrl.startsWith('https') ? https : http;
+      const isRedirect =
+        [301, 302, 303, 307, 308].includes(upstreamRes.statusCode) &&
+        upstreamRes.headers.location;
 
-      activeProxyReq = lib.get(targetUrl, (proxyRes) => {
-        if (closed) {
-          proxyRes.resume();
-          return;
-        }
+      if (isRedirect) {
+        upstreamRes.resume();
+        const nextUrl = new URL(upstreamRes.headers.location, parsed).toString();
+        return follow(nextUrl, redirectsLeft - 1);
+      }
 
-        if ([301, 302, 303, 307, 308].includes(proxyRes.statusCode) && proxyRes.headers.location) {
-          proxyRes.resume();
-          let redirectUrl = proxyRes.headers.location;
-          if (redirectUrl.startsWith('/')) {
-            const parsedBase = new URL(targetUrl);
-            redirectUrl = `${parsedBase.protocol}//${parsedBase.host}${redirectUrl}`;
-          }
-          return fetchWithRedirects(redirectUrl, maxRedirects - 1);
-        }
+      if (!res.headersSent && !res.writableEnded) {
+        res.writeHead(upstreamRes.statusCode || 200, {
+          'Content-Type': upstreamRes.headers['content-type'] || 'audio/mpeg',
+          'Cache-Control': 'no-cache, no-store',
+          'Connection': 'keep-alive'
+        });
+      }
 
-        if (!res.headersSent && !res.writableEnded) {
-          let contentType = proxyRes.headers['content-type'] || 'audio/mpeg';
-          if (targetUrl.includes('.m3u8')) contentType = 'application/vnd.apple.mpegurl';
-          else if (targetUrl.includes('.ts')) contentType = 'video/mp2t';
+      upstreamRes.on('error', cleanup);
+      upstreamRes.pipe(res);
+    });
 
-          res.writeHead(proxyRes.statusCode || 200, {
-            'Content-Type': contentType,
-            'Access-Control-Allow-Origin': '*',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive'
-          });
-        }
-        proxyRes.pipe(res);
-      });
+    activeReq.on('error', () => {
+      if (!closed && !res.headersSent && !res.writableEnded) {
+        res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Yayın kaynağına bağlanılamadı');
+      }
+      cleanup();
+    });
+  };
 
-      activeProxyReq.on('error', () => {
-        if (!closed && !res.headersSent && !res.writableEnded) {
-          res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-          res.end('Proxy bağlantı hatası');
-        }
-      });
-    }
+  req.on('close', cleanup);
+  req.on('aborted', cleanup);
+  res.on('close', cleanup);
 
-    fetchWithRedirects(streamUrl);
+  follow(targetUrl);
+}
 
-    req.on('close', cleanupProxy);
-    res.on('close', cleanupProxy);
+function handleTranscode(req, res, targetUrl, bitrate) {
+  const allowedBitrates = ['12k', '24k', '32k', '48k'];
+  const safeBitrate = allowedBitrates.includes(bitrate) ? bitrate : '32k';
 
-    return;
+  if (!res.headersSent && !res.writableEnded) {
+    res.writeHead(200, {
+      'Content-Type': 'audio/mpeg',
+      'Cache-Control': 'no-cache, no-store',
+      'Connection': 'keep-alive'
+    });
   }
-
-  // 2. DURUM: BR VAR -> VERİ TASARRUFU İÇİN FFMPEG İLE SIKIŞTIRMA
-  res.writeHead(200, {
-    'Content-Type': 'audio/mpeg',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-    'Access-Control-Allow-Origin': '*'
-  });
 
   const ffmpeg = spawn('ffmpeg', [
     '-reconnect', '1',
     '-reconnect_streamed', '1',
-    '-reconnect_delay_max', '1',
-    '-i', streamUrl,
+    '-reconnect_delay_max', '2',
+    '-i', targetUrl,
     '-vn',
     '-ac', '1',
     '-ar', '22050',
-    '-b:a', bitrate,
+    '-b:a', safeBitrate,
     '-f', 'mp3',
     'pipe:1'
   ]);
 
-  let cleanedUp = false;
-  let lastDataTime = Date.now();
+  let cleaned = false;
 
-  const stallWatchdog = setInterval(() => {
-    if (Date.now() - lastDataTime > 20000) {
-      cleanup('FFmpeg veri akışı durdu');
-    }
-  }, 5000);
-
-  function cleanup() {
-    if (cleanedUp) return;
-    cleanedUp = true;
-    clearInterval(stallWatchdog);
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
 
     try {
       ffmpeg.stdout.removeAllListeners();
       ffmpeg.stderr.removeAllListeners();
       ffmpeg.removeAllListeners();
+      if (ffmpeg.stdin && !ffmpeg.stdin.destroyed) ffmpeg.stdin.destroy();
       if (ffmpeg.stdout && !ffmpeg.stdout.destroyed) ffmpeg.stdout.destroy();
       if (ffmpeg.stderr && !ffmpeg.stderr.destroyed) ffmpeg.stderr.destroy();
       ffmpeg.kill('SIGKILL');
-    } catch (e) {}
+    } catch (_) {}
 
     if (!res.writableEnded && !res.destroyed) {
-      try {
-        res.end();
-      } catch (e) {}
+      try { res.end(); } catch (_) {}
     }
-  }
+  };
+
+  ffmpeg.stderr.resume();
 
   ffmpeg.stdout.on('data', (chunk) => {
-    lastDataTime = Date.now();
-    if (!cleanedUp && !res.writableEnded && !res.destroyed) {
-      const canWrite = res.write(chunk);
-      if (!canWrite) {
-        ffmpeg.stdout.pause();
-        res.once('drain', () => {
-          if (!cleanedUp && !ffmpeg.stdout.destroyed) ffmpeg.stdout.resume();
-        });
-      }
+    if (cleaned || res.writableEnded || res.destroyed) return;
+    const ok = res.write(chunk);
+    if (!ok) {
+      ffmpeg.stdout.pause();
+      res.once('drain', () => {
+        if (!cleaned && !ffmpeg.stdout.destroyed) {
+          ffmpeg.stdout.resume();
+        }
+      });
     }
   });
 
   ffmpeg.stdout.on('end', cleanup);
-  ffmpeg.stderr.resume();
-
   ffmpeg.on('error', cleanup);
   ffmpeg.on('close', cleanup);
 
   req.on('close', cleanup);
+  req.on('aborted', cleanup);
   res.on('close', cleanup);
+}
 
-}).listen(PORT, () => console.log(`Sunucu ${PORT} portunda çalışıyor`));
+http.createServer((req, res) => {
+  setCorsHeaders(res);
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    return res.end();
+  }
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  } catch (_) {
+    res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end('Geçersiz istek');
+  }
+
+  const streamUrl = parsedUrl.searchParams.get('url');
+  const bitrate = parsedUrl.searchParams.get('br');
+
+  if (!streamUrl) {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end('Radyo Sunucusu Aktif');
+  }
+
+  if (bitrate) {
+    return handleTranscode(req, res, streamUrl, bitrate);
+  }
+
+  return handleProxy(req, res, streamUrl);
+}).listen(PORT, () => {
+  console.log(`Sunucu ${PORT} portunda çalışıyor`);
+});
