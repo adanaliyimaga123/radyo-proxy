@@ -17,7 +17,7 @@ http.createServer((req, res) => {
     return res.end('Radyo Proxy ve Sıkıştırma Sunucusu Aktif!');
   }
 
-  // 1. DURUM: BR YOK -> PROXY MODU (.m3u8 ve .ts dosyaları için akıllı yönlendirme)
+  // 1. DURUM: BR YOK -> YÖNLENDİRME DESTEKLİ DİREKT PROXY (ORİJİNAL KALİTE)
   if (!bitrate) {
     let activeProxyReq = null;
 
@@ -25,7 +25,7 @@ http.createServer((req, res) => {
       if (maxRedirects <= 0) {
         if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-          res.end('Redirect loop');
+          res.end('Çok fazla yönlendirme (Redirect loop)');
         }
         return;
       }
@@ -33,7 +33,6 @@ http.createServer((req, res) => {
       const lib = targetUrl.startsWith('https') ? https : http;
 
       activeProxyReq = lib.get(targetUrl, (proxyRes) => {
-        // Yönlendirmeleri takip et
         if ([301, 302, 303, 307, 308].includes(proxyRes.statusCode) && proxyRes.headers.location) {
           proxyRes.resume();
           let redirectUrl = proxyRes.headers.location;
@@ -45,7 +44,6 @@ http.createServer((req, res) => {
         }
 
         if (!res.headersSent) {
-          // HLS uzantıları için doğru içerik türlerini (Content-Type) koru
           let contentType = proxyRes.headers['content-type'] || 'audio/mpeg';
           if (targetUrl.includes('.m3u8')) contentType = 'application/vnd.apple.mpegurl';
           else if (targetUrl.includes('.ts')) contentType = 'video/mp2t';
@@ -77,7 +75,7 @@ http.createServer((req, res) => {
     return;
   }
 
-  // 2. DURUM: BR VAR -> FFMPEG İLE SIKIŞTIRMA
+  // 2. DURUM: BR VAR -> VERİ TASARRUFU İÇİN FFMPEG İLE SIKIŞTIRMA
   res.writeHead(200, {
     'Content-Type': 'audio/mpeg',
     'Cache-Control': 'no-cache',
@@ -98,12 +96,51 @@ http.createServer((req, res) => {
     'pipe:1'
   ]);
 
-  ffmpeg.stdout.pipe(res);
+  let cleanedUp = false;
+  let lastDataTime = Date.now();
 
-  req.on('close', () => {
-    ffmpeg.kill('SIGKILL');
+  const stallWatchdog = setInterval(() => {
+    if (Date.now() - lastDataTime > 20000) {
+      cleanup('FFmpeg veri akışı durdu');
+    }
+  }, 5000);
+
+  function cleanup(reason) {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    clearInterval(stallWatchdog);
+    try {
+      ffmpeg.stdout.removeAllListeners();
+      ffmpeg.stderr.removeAllListeners();
+      ffmpeg.kill('SIGKILL');
+    } catch (e) {}
+    if (!res.writableEnded) {
+      try {
+        res.end();
+      } catch (e) {}
+    }
+  }
+
+  ffmpeg.stdout.on('data', (chunk) => {
+    lastDataTime = Date.now();
+    if (!cleanedUp && !res.writableEnded) {
+      const canWrite = res.write(chunk);
+      if (!canWrite) {
+        ffmpeg.stdout.pause();
+        res.once('drain', () => {
+          if (!cleanedUp) ffmpeg.stdout.resume();
+        });
+      }
+    }
   });
 
-  ffmpeg.on('error', () => {});
+  ffmpeg.stdout.on('end', () => cleanup('stdout ended'));
+  ffmpeg.stderr.resume();
+
+  ffmpeg.on('error', () => cleanup('ffmpeg error'));
+  ffmpeg.on('close', () => cleanup('ffmpeg closed'));
+
+  req.on('close', () => cleanup('client closed'));
+  res.on('close', () => cleanup('res closed'));
 
 }).listen(PORT, () => console.log(`Sunucu ${PORT} portunda çalışıyor`));
