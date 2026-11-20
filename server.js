@@ -20,10 +20,21 @@ http.createServer((req, res) => {
   // 1. DURUM: BR YOK -> YÖNLENDİRME DESTEKLİ DİREKT PROXY (ORİJİNAL KALİTE)
   if (!bitrate) {
     let activeProxyReq = null;
+    let closed = false;
+
+    function cleanupProxy() {
+      if (closed) return;
+      closed = true;
+      if (activeProxyReq) {
+        try { activeProxyReq.destroy(); } catch (e) {}
+        activeProxyReq = null;
+      }
+    }
 
     function fetchWithRedirects(targetUrl, maxRedirects = 5) {
+      if (closed) return;
       if (maxRedirects <= 0) {
-        if (!res.headersSent) {
+        if (!res.headersSent && !res.writableEnded) {
           res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
           res.end('Çok fazla yönlendirme (Redirect loop)');
         }
@@ -33,6 +44,11 @@ http.createServer((req, res) => {
       const lib = targetUrl.startsWith('https') ? https : http;
 
       activeProxyReq = lib.get(targetUrl, (proxyRes) => {
+        if (closed) {
+          proxyRes.resume();
+          return;
+        }
+
         if ([301, 302, 303, 307, 308].includes(proxyRes.statusCode) && proxyRes.headers.location) {
           proxyRes.resume();
           let redirectUrl = proxyRes.headers.location;
@@ -43,7 +59,7 @@ http.createServer((req, res) => {
           return fetchWithRedirects(redirectUrl, maxRedirects - 1);
         }
 
-        if (!res.headersSent) {
+        if (!res.headersSent && !res.writableEnded) {
           let contentType = proxyRes.headers['content-type'] || 'audio/mpeg';
           if (targetUrl.includes('.m3u8')) contentType = 'application/vnd.apple.mpegurl';
           else if (targetUrl.includes('.ts')) contentType = 'video/mp2t';
@@ -59,7 +75,7 @@ http.createServer((req, res) => {
       });
 
       activeProxyReq.on('error', () => {
-        if (!res.headersSent) {
+        if (!closed && !res.headersSent && !res.writableEnded) {
           res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
           res.end('Proxy bağlantı hatası');
         }
@@ -68,9 +84,8 @@ http.createServer((req, res) => {
 
     fetchWithRedirects(streamUrl);
 
-    req.on('close', () => {
-      if (activeProxyReq) activeProxyReq.destroy();
-    });
+    req.on('close', cleanupProxy);
+    res.on('close', cleanupProxy);
 
     return;
   }
@@ -105,16 +120,21 @@ http.createServer((req, res) => {
     }
   }, 5000);
 
-  function cleanup(reason) {
+  function cleanup() {
     if (cleanedUp) return;
     cleanedUp = true;
     clearInterval(stallWatchdog);
+
     try {
       ffmpeg.stdout.removeAllListeners();
       ffmpeg.stderr.removeAllListeners();
+      ffmpeg.removeAllListeners();
+      if (ffmpeg.stdout && !ffmpeg.stdout.destroyed) ffmpeg.stdout.destroy();
+      if (ffmpeg.stderr && !ffmpeg.stderr.destroyed) ffmpeg.stderr.destroy();
       ffmpeg.kill('SIGKILL');
     } catch (e) {}
-    if (!res.writableEnded) {
+
+    if (!res.writableEnded && !res.destroyed) {
       try {
         res.end();
       } catch (e) {}
@@ -123,24 +143,24 @@ http.createServer((req, res) => {
 
   ffmpeg.stdout.on('data', (chunk) => {
     lastDataTime = Date.now();
-    if (!cleanedUp && !res.writableEnded) {
+    if (!cleanedUp && !res.writableEnded && !res.destroyed) {
       const canWrite = res.write(chunk);
       if (!canWrite) {
         ffmpeg.stdout.pause();
         res.once('drain', () => {
-          if (!cleanedUp) ffmpeg.stdout.resume();
+          if (!cleanedUp && !ffmpeg.stdout.destroyed) ffmpeg.stdout.resume();
         });
       }
     }
   });
 
-  ffmpeg.stdout.on('end', () => cleanup('stdout ended'));
+  ffmpeg.stdout.on('end', cleanup);
   ffmpeg.stderr.resume();
 
-  ffmpeg.on('error', () => cleanup('ffmpeg error'));
-  ffmpeg.on('close', () => cleanup('ffmpeg closed'));
+  ffmpeg.on('error', cleanup);
+  ffmpeg.on('close', cleanup);
 
-  req.on('close', () => cleanup('client closed'));
-  res.on('close', () => cleanup('res closed'));
+  req.on('close', cleanup);
+  res.on('close', cleanup);
 
 }).listen(PORT, () => console.log(`Sunucu ${PORT} portunda çalışıyor`));
